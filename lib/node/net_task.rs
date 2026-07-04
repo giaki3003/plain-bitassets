@@ -152,6 +152,10 @@ fn connect_tip_(
     let () = archive.put_header(rwtxn, header)?;
     let () = archive.put_body(rwtxn, block_hash, body)?;
     for transaction in &body.transactions {
+        // Evict any mempool transactions that conflict with this block
+        // transaction by spending the same UTXOs, then delete the
+        // transaction itself (and any descendants) by txid.
+        let () = mempool.delete_spent_utxos(rwtxn, &transaction.inputs)?;
         let () = mempool.delete(rwtxn, transaction.txid())?;
     }
     Ok(())

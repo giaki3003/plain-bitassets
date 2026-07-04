@@ -196,6 +196,29 @@ impl MemPool {
         Ok(())
     }
 
+    /// Evict any mempool transactions (and their descendants) whose inputs
+    /// were spent by a confirmed transaction. A double-spending mempool
+    /// transaction has a distinct txid, so deleting confirmed transactions by
+    /// txid alone would leave the conflicting transaction behind with a
+    /// now-invalid spent-utxo entry.
+    pub fn delete_spent_utxos<'a, Iter>(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoints: Iter,
+    ) -> Result<(), Error>
+    where
+        Iter: IntoIterator<Item = &'a OutPoint>,
+    {
+        for outpoint in outpoints {
+            if let Some(InPoint::Regular { txid, .. }) =
+                self.spent_utxos.try_get(rwtxn, outpoint)?
+            {
+                let () = self.delete(rwtxn, txid)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn delete(&self, rwtxn: &mut RwTxn, txid: Txid) -> Result<(), Error> {
         let mut pending_deletes = VecDeque::from([txid]);
         while let Some(txid) = pending_deletes.pop_front() {
