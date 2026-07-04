@@ -870,7 +870,11 @@ fn disconnect_event(
             if !state.utxos.delete(rwtxn, &outpoint_key)? {
                 return Err(error::NoUtxo { outpoint }.into());
             }
-            *latest_deposit_block_hash = Some(event_block_hash);
+            // Blocks are iterated in reverse here, so the first event block
+            // hash seen is the latest. Keep it to match what `connect` stored.
+            if latest_deposit_block_hash.is_none() {
+                *latest_deposit_block_hash = Some(event_block_hash);
+            }
         }
         BlockEvent::WithdrawalBundle(withdrawal_bundle_event) => {
             let () = disconnect_withdrawal_bundle_event(
@@ -879,7 +883,12 @@ fn disconnect_event(
                 block_height,
                 withdrawal_bundle_event,
             )?;
-            *latest_withdrawal_bundle_event_block_hash = Some(event_block_hash);
+            // Blocks are iterated in reverse here, so the first event block
+            // hash seen is the latest. Keep it to match what `connect` stored.
+            if latest_withdrawal_bundle_event_block_hash.is_none() {
+                *latest_withdrawal_bundle_event_block_hash =
+                    Some(event_block_hash);
+            }
         }
     }
     Ok(())
@@ -1001,7 +1010,7 @@ mod test {
             HeightStamped, RollBack, State, WithdrawalBundleInfo,
             test::{bitcoin_filled_output, fresh_state},
             two_way_peg_data::{
-                collect_withdrawal_bundle, disconnect,
+                collect_withdrawal_bundle, connect, disconnect,
                 disconnect_withdrawal_bundle_failed,
             },
         },
@@ -1325,6 +1334,158 @@ mod test {
             rwtxn.commit()?;
         }
 
+        Ok(())
+    }
+
+    // connecting deposits spanning two mainchain blocks then disconnecting must
+    // keep the latest event block hash (matching what `connect` stored) so the
+    // disconnect assertion does not panic, and must fully restore state
+    #[test]
+    fn disconnect_multi_block_deposits_round_trips() -> anyhow::Result<()> {
+        use crate::types::proto::mainchain::Deposit;
+
+        let (env, state) =
+            fresh_state("disconnect_multi_block_deposits_round_trips")?;
+
+        let block_height = 1u32;
+        let event_block_hash_0 = bitcoin::BlockHash::from_byte_array([20; 32]);
+        let event_block_hash_1 = bitcoin::BlockHash::from_byte_array([21; 32]);
+        let deposit_outpoint_0 = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([2; 32]),
+            vout: 0,
+        };
+        let deposit_outpoint_1 = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([3; 32]),
+            vout: 0,
+        };
+        let deposit_key_0 =
+            OutPointKey::from(&OutPoint::Deposit(deposit_outpoint_0));
+        let deposit_key_1 =
+            OutPointKey::from(&OutPoint::Deposit(deposit_outpoint_1));
+
+        let two_way_peg_data = {
+            let mut block_info = LinkedHashMap::new();
+            block_info.insert(
+                event_block_hash_0,
+                BlockInfo {
+                    bmm_commitment: None,
+                    events: vec![BlockEvent::Deposit(Deposit {
+                        tx_index: 0,
+                        outpoint: deposit_outpoint_0,
+                        output: bitcoin_filled_output(Address::ALL_ZEROS, 1000),
+                    })],
+                },
+            );
+            block_info.insert(
+                event_block_hash_1,
+                BlockInfo {
+                    bmm_commitment: None,
+                    events: vec![BlockEvent::Deposit(Deposit {
+                        tx_index: 0,
+                        outpoint: deposit_outpoint_1,
+                        output: bitcoin_filled_output(Address::ALL_ZEROS, 2000),
+                    })],
+                },
+            );
+            TwoWayPegData { block_info }
+        };
+
+        let mut rwtxn = env.write_txn()?;
+        state.height.put(&mut rwtxn, &(), &block_height)?;
+        connect(&state, &mut rwtxn, &two_way_peg_data)?;
+        anyhow::ensure!(state.utxos.try_get(&rwtxn, &deposit_key_0)?.is_some());
+        anyhow::ensure!(state.utxos.try_get(&rwtxn, &deposit_key_1)?.is_some());
+        // a single deposit block record is stored, for the latest block hash
+        let (_, (stored_hash, _)) = state
+            .deposit_blocks
+            .last(&rwtxn)?
+            .expect("connect should store a deposit block");
+        anyhow::ensure!(stored_hash == event_block_hash_1);
+
+        // disconnecting in reverse must not panic on the latest-hash assertion
+        disconnect(&state, &mut rwtxn, &two_way_peg_data)?;
+        anyhow::ensure!(state.utxos.try_get(&rwtxn, &deposit_key_0)?.is_none());
+        anyhow::ensure!(state.utxos.try_get(&rwtxn, &deposit_key_1)?.is_none());
+        anyhow::ensure!(state.deposit_blocks.last(&rwtxn)?.is_none());
+        rwtxn.commit()?;
+        Ok(())
+    }
+
+    // connecting withdrawal bundle events spanning two mainchain blocks then
+    // disconnecting must keep the latest event block hash (matching what
+    // `connect` stored) so the disconnect assertion does not panic, and must
+    // fully restore state
+    #[test]
+    fn disconnect_multi_block_withdrawal_events_round_trips()
+    -> anyhow::Result<()> {
+        let (env, state) = fresh_state(
+            "disconnect_multi_block_withdrawal_events_round_trips",
+        )?;
+
+        let block_height = 1u32;
+        let event_block_hash_0 = bitcoin::BlockHash::from_byte_array([20; 32]);
+        let event_block_hash_1 = bitcoin::BlockHash::from_byte_array([21; 32]);
+        let m6id_0 = M6id(bitcoin::Txid::from_byte_array([5; 32]));
+        let m6id_1 = M6id(bitcoin::Txid::from_byte_array([6; 32]));
+
+        let two_way_peg_data = {
+            let mut block_info = LinkedHashMap::new();
+            block_info.insert(
+                event_block_hash_0,
+                BlockInfo {
+                    bmm_commitment: None,
+                    events: vec![BlockEvent::WithdrawalBundle(
+                        WithdrawalBundleEvent {
+                            m6id: m6id_0,
+                            status: WithdrawalBundleEventStatus::Submitted,
+                        },
+                    )],
+                },
+            );
+            block_info.insert(
+                event_block_hash_1,
+                BlockInfo {
+                    bmm_commitment: None,
+                    events: vec![BlockEvent::WithdrawalBundle(
+                        WithdrawalBundleEvent {
+                            m6id: m6id_1,
+                            status: WithdrawalBundleEventStatus::Submitted,
+                        },
+                    )],
+                },
+            );
+            TwoWayPegData { block_info }
+        };
+
+        let mut rwtxn = env.write_txn()?;
+        state.height.put(&mut rwtxn, &(), &block_height)?;
+        connect(&state, &mut rwtxn, &two_way_peg_data)?;
+        anyhow::ensure!(
+            state.withdrawal_bundles.try_get(&rwtxn, &m6id_0)?.is_some()
+        );
+        anyhow::ensure!(
+            state.withdrawal_bundles.try_get(&rwtxn, &m6id_1)?.is_some()
+        );
+        // a single withdrawal bundle event block record is stored, for the
+        // latest block hash
+        let (_, (stored_hash, _)) = state
+            .withdrawal_bundle_event_blocks
+            .last(&rwtxn)?
+            .expect("connect should store a withdrawal bundle event block");
+        anyhow::ensure!(stored_hash == event_block_hash_1);
+
+        // disconnecting in reverse must not panic on the latest-hash assertion
+        disconnect(&state, &mut rwtxn, &two_way_peg_data)?;
+        anyhow::ensure!(
+            state.withdrawal_bundles.try_get(&rwtxn, &m6id_0)?.is_none()
+        );
+        anyhow::ensure!(
+            state.withdrawal_bundles.try_get(&rwtxn, &m6id_1)?.is_none()
+        );
+        anyhow::ensure!(
+            state.withdrawal_bundle_event_blocks.last(&rwtxn)?.is_none()
+        );
+        rwtxn.commit()?;
         Ok(())
     }
 }
