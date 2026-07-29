@@ -664,6 +664,19 @@ impl State {
             .map_err(Error::Authorization)?;
         let fee =
             self.validate_filled_transaction(rotxn, &filled_transaction)?;
+        /* An AMM swap declares the amount to receive, which is only checked
+         * against the pool state when the tx is applied. That check cannot be
+         * part of block validation, since swaps in a block are applied
+         * sequentially, but a swap that is stale with respect to the current
+         * pool state can never be applied at the front of a block, so it must
+         * not be accepted into the mempool. */
+        if filled_transaction.is_amm_swap() {
+            let () = amm::validate_swap(
+                &self.amm_pools,
+                rotxn,
+                &filled_transaction,
+            )?;
+        }
         Ok(fee)
     }
 
